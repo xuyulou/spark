@@ -18,21 +18,18 @@
 package org.apache.spark.ml.evaluation
 
 import org.apache.spark.SparkContext
-import org.apache.spark.annotation.{Experimental, Since}
+import org.apache.spark.annotation.Since
 import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.ml.attribute.AttributeGroup
-import org.apache.spark.ml.linalg.{BLAS, DenseVector, SparseVector, Vector, Vectors, VectorUDT}
+import org.apache.spark.ml.linalg.{BLAS, DenseVector, SparseVector, Vector, Vectors}
 import org.apache.spark.ml.param.{Param, ParamMap, ParamValidators}
 import org.apache.spark.ml.param.shared.{HasFeaturesCol, HasPredictionCol}
-import org.apache.spark.ml.util.{DefaultParamsReadable, DefaultParamsWritable, Identifiable,
-  SchemaUtils}
+import org.apache.spark.ml.util._
 import org.apache.spark.sql.{Column, DataFrame, Dataset}
 import org.apache.spark.sql.functions.{avg, col, udf}
 import org.apache.spark.sql.types.DoubleType
 
 /**
- * :: Experimental ::
- *
  * Evaluator for clustering results.
  * The metric computes the Silhouette measure using the specified distance measure.
  *
@@ -40,7 +37,6 @@ import org.apache.spark.sql.types.DoubleType
  * between 1 and -1, where a value close to 1 means that the points in a cluster are close to the
  * other points in the same cluster and far from the points of the other clusters.
  */
-@Experimental
 @Since("2.3.0")
 class ClusteringEvaluator @Since("2.3.0") (@Since("2.3.0") override val uid: String)
   extends Evaluator with HasPredictionCol with HasFeaturesCol with DefaultParamsWritable {
@@ -107,15 +103,21 @@ class ClusteringEvaluator @Since("2.3.0") (@Since("2.3.0") override val uid: Str
 
   @Since("2.3.0")
   override def evaluate(dataset: Dataset[_]): Double = {
-    SchemaUtils.checkColumnType(dataset.schema, $(featuresCol), new VectorUDT)
+    SchemaUtils.validateVectorCompatibleColumn(dataset.schema, $(featuresCol))
     SchemaUtils.checkNumericType(dataset.schema, $(predictionCol))
+
+    val vectorCol = DatasetUtils.columnToVector(dataset, $(featuresCol))
+    val df = dataset.select(col($(predictionCol)),
+      vectorCol.as($(featuresCol), dataset.schema($(featuresCol)).metadata))
 
     ($(metricName), $(distanceMeasure)) match {
       case ("silhouette", "squaredEuclidean") =>
         SquaredEuclideanSilhouette.computeSilhouetteScore(
-          dataset, $(predictionCol), $(featuresCol))
+          df, $(predictionCol), $(featuresCol))
       case ("silhouette", "cosine") =>
-        CosineSilhouette.computeSilhouetteScore(dataset, $(predictionCol), $(featuresCol))
+        CosineSilhouette.computeSilhouetteScore(df, $(predictionCol), $(featuresCol))
+      case (mn, dm) =>
+        throw new IllegalArgumentException(s"No support for metric $mn, distance $dm")
     }
   }
 }
@@ -141,27 +143,27 @@ private[evaluation] abstract class Silhouette {
       pointClusterId: Double,
       pointClusterNumOfPoints: Long,
       averageDistanceToCluster: (Double) => Double): Double = {
-    // Here we compute the average dissimilarity of the current point to any cluster of which the
-    // point is not a member.
-    // The cluster with the lowest average dissimilarity - i.e. the nearest cluster to the current
-    // point - is said to be the "neighboring cluster".
-    val otherClusterIds = clusterIds.filter(_ != pointClusterId)
-    val neighboringClusterDissimilarity = otherClusterIds.map(averageDistanceToCluster).min
-
-    // adjustment for excluding the node itself from the computation of the average dissimilarity
-    val currentClusterDissimilarity = if (pointClusterNumOfPoints == 1) {
+    if (pointClusterNumOfPoints == 1) {
+      // Single-element clusters have silhouette 0
       0.0
     } else {
-      averageDistanceToCluster(pointClusterId) * pointClusterNumOfPoints /
-        (pointClusterNumOfPoints - 1)
-    }
-
-    if (currentClusterDissimilarity < neighboringClusterDissimilarity) {
-      1 - (currentClusterDissimilarity / neighboringClusterDissimilarity)
-    } else if (currentClusterDissimilarity > neighboringClusterDissimilarity) {
-      (neighboringClusterDissimilarity / currentClusterDissimilarity) - 1
-    } else {
-      0.0
+      // Here we compute the average dissimilarity of the current point to any cluster of which the
+      // point is not a member.
+      // The cluster with the lowest average dissimilarity - i.e. the nearest cluster to the current
+      // point - is said to be the "neighboring cluster".
+      val otherClusterIds = clusterIds.filter(_ != pointClusterId)
+      val neighboringClusterDissimilarity = otherClusterIds.map(averageDistanceToCluster).min
+      // adjustment for excluding the node itself from the computation of the average dissimilarity
+      val currentClusterDissimilarity =
+        averageDistanceToCluster(pointClusterId) * pointClusterNumOfPoints /
+          (pointClusterNumOfPoints - 1)
+      if (currentClusterDissimilarity < neighboringClusterDissimilarity) {
+        1 - (currentClusterDissimilarity / neighboringClusterDissimilarity)
+      } else if (currentClusterDissimilarity > neighboringClusterDissimilarity) {
+        (neighboringClusterDissimilarity / currentClusterDissimilarity) - 1
+      } else {
+        0.0
+      }
     }
   }
 

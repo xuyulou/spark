@@ -17,8 +17,6 @@
 
 package org.apache.spark.ml.clustering
 
-import scala.language.existentials
-
 import org.apache.hadoop.fs.Path
 
 import org.apache.spark.ml.linalg.{Vector, Vectors}
@@ -34,9 +32,8 @@ object LDASuite {
       vocabSize: Int): DataFrame = {
     val avgWC = 1  // average instances of each word in a doc
     val sc = spark.sparkContext
-    val rng = new java.util.Random()
-    rng.setSeed(1)
     val rdd = sc.parallelize(1 to rows).map { i =>
+      val rng = new java.util.Random(i)
       Vectors.dense(Array.fill(vocabSize)(rng.nextInt(2 * avgWC).toDouble))
     }.map(v => new TestRow(v))
     spark.createDataFrame(rdd)
@@ -65,7 +62,7 @@ class LDASuite extends MLTest with DefaultReadWriteTest {
 
   val k: Int = 5
   val vocabSize: Int = 30
-  @transient var dataset: Dataset[_] = _
+  @transient var dataset: DataFrame = _
 
   override def beforeAll(): Unit = {
     super.beforeAll()
@@ -286,7 +283,7 @@ class LDASuite extends MLTest with DefaultReadWriteTest {
     // There should be 1 checkpoint remaining.
     assert(model.getCheckpointFiles.length === 1)
     val checkpointFile = new Path(model.getCheckpointFiles.head)
-    val fs = checkpointFile.getFileSystem(spark.sparkContext.hadoopConfiguration)
+    val fs = checkpointFile.getFileSystem(spark.sessionState.newHadoopConf())
     assert(fs.exists(checkpointFile))
     model.deleteCheckpointFiles()
     assert(model.getCheckpointFiles.isEmpty)
@@ -330,8 +327,7 @@ class LDASuite extends MLTest with DefaultReadWriteTest {
       (model.logLikelihood(dataset), model.logPerplexity(dataset))
     }
 
-    val (newDataset, newDatasetD, newDatasetF) = MLTestingUtils.generateArrayFeatureDataset(dataset)
-    val (ll, lp) = trainAndLogLikelihoodAndPerplexity(newDataset)
+    val (_, newDatasetD, newDatasetF) = MLTestingUtils.generateArrayFeatureDataset(dataset)
     val (llD, lpD) = trainAndLogLikelihoodAndPerplexity(newDatasetD)
     val (llF, lpF) = trainAndLogLikelihoodAndPerplexity(newDatasetF)
     // TODO: need to compare the results once we fix the seed issue for LDA (SPARK-22210)

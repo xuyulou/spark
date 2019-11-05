@@ -25,7 +25,7 @@ import breeze.stats.distributions.StudentsT
 import org.apache.hadoop.fs.Path
 
 import org.apache.spark.SparkException
-import org.apache.spark.annotation.{Experimental, Since}
+import org.apache.spark.annotation.Since
 import org.apache.spark.internal.Logging
 import org.apache.spark.ml.{PipelineStage, PredictorParams}
 import org.apache.spark.ml.feature.Instance
@@ -37,12 +37,12 @@ import org.apache.spark.ml.optim.loss.{L2Regularization, RDDLossFunction}
 import org.apache.spark.ml.param.{DoubleParam, Param, ParamMap, ParamValidators}
 import org.apache.spark.ml.param.shared._
 import org.apache.spark.ml.util._
+import org.apache.spark.ml.util.Instrumentation.instrumented
 import org.apache.spark.mllib.evaluation.RegressionMetrics
 import org.apache.spark.mllib.linalg.VectorImplicits._
 import org.apache.spark.mllib.regression.{LinearRegressionModel => OldLinearRegressionModel}
 import org.apache.spark.mllib.stat.MultivariateOnlineSummarizer
 import org.apache.spark.mllib.util.MLUtils
-import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.{DataFrame, Dataset, Row, SparkSession}
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types.{DataType, DoubleType, StructType}
@@ -108,12 +108,13 @@ private[regression] trait LinearRegressionParams extends PredictorParams
       schema: StructType,
       fitting: Boolean,
       featuresDataType: DataType): StructType = {
-    if ($(loss) == Huber) {
-      require($(solver)!= Normal, "LinearRegression with huber loss doesn't support " +
-        "normal solver, please change solver to auto or l-bfgs.")
-      require($(elasticNetParam) == 0.0, "LinearRegression with huber loss only supports " +
-        s"L2 regularization, but got elasticNetParam = $getElasticNetParam.")
-
+    if (fitting) {
+      if ($(loss) == Huber) {
+        require($(solver)!= Normal, "LinearRegression with huber loss doesn't support " +
+          "normal solver, please change solver to auto or l-bfgs.")
+        require($(elasticNetParam) == 0.0, "LinearRegression with huber loss only supports " +
+          s"L2 regularization, but got elasticNetParam = $getElasticNetParam.")
+      }
     }
     super.validateAndTransformSchema(schema, fitting, featuresDataType)
   }
@@ -315,20 +316,17 @@ class LinearRegression @Since("1.3.0") (@Since("1.3.0") override val uid: String
   def setEpsilon(value: Double): this.type = set(epsilon, value)
   setDefault(epsilon -> 1.35)
 
-  override protected def train(dataset: Dataset[_]): LinearRegressionModel = {
+  override protected def train(dataset: Dataset[_]): LinearRegressionModel = instrumented { instr =>
     // Extract the number of features before deciding optimization solver.
     val numFeatures = dataset.select(col($(featuresCol))).first().getAs[Vector](0).size
-    val w = if (!isDefined(weightCol) || $(weightCol).isEmpty) lit(1.0) else col($(weightCol))
 
-    val instances: RDD[Instance] = dataset.select(
-      col($(labelCol)), w, col($(featuresCol))).rdd.map {
-      case Row(label: Double, weight: Double, features: Vector) =>
-        Instance(label, weight, features)
-    }
+    val instances = extractInstances(dataset)
 
-    val instr = Instrumentation.create(this, dataset)
-    instr.logParams(labelCol, featuresCol, weightCol, predictionCol, solver, tol, elasticNetParam,
-      fitIntercept, maxIter, regParam, standardization, aggregationDepth, loss, epsilon)
+    instr.logPipelineStage(this)
+    instr.logDataset(dataset)
+    instr.logParams(this, labelCol, featuresCol, weightCol, predictionCol, solver, tol,
+      elasticNetParam, fitIntercept, maxIter, regParam, standardization, aggregationDepth, loss,
+      epsilon)
     instr.logNumFeatures(numFeatures)
 
     if ($(loss) == SquaredError && (($(solver) == Auto &&
@@ -353,9 +351,7 @@ class LinearRegression @Since("1.3.0") (@Since("1.3.0") override val uid: String
         model.diagInvAtWA.toArray,
         model.objectiveHistory)
 
-      lrModel.setSummary(Some(trainingSummary))
-      instr.logSuccess(lrModel)
-      return lrModel
+      return lrModel.setSummary(Some(trainingSummary))
     }
 
     val handlePersistence = dataset.storageLevel == StorageLevel.NONE
@@ -415,9 +411,7 @@ class LinearRegression @Since("1.3.0") (@Since("1.3.0") override val uid: String
           Array(0D),
           Array(0D))
 
-        model.setSummary(Some(trainingSummary))
-        instr.logSuccess(model)
-        return model
+        return model.setSummary(Some(trainingSummary))
       } else {
         require($(regParam) == 0.0, "The standard deviation of the label is zero. " +
           "Model cannot be regularized.")
@@ -532,8 +526,8 @@ class LinearRegression @Since("1.3.0") (@Since("1.3.0") override val uid: String
         throw new SparkException(msg)
       }
 
-      bcFeaturesMean.destroy(blocking = false)
-      bcFeaturesStd.destroy(blocking = false)
+      bcFeaturesMean.destroy()
+      bcFeaturesStd.destroy()
 
       val parameters = state.x.toArray.clone()
 
@@ -596,8 +590,6 @@ class LinearRegression @Since("1.3.0") (@Since("1.3.0") override val uid: String
       objectiveHistory)
 
     model.setSummary(Some(trainingSummary))
-    instr.logSuccess(model)
-    model
   }
 
   @Since("1.4.0")
@@ -650,33 +642,20 @@ class LinearRegressionModel private[ml] (
     @Since("1.3.0") val intercept: Double,
     @Since("2.3.0") val scale: Double)
   extends RegressionModel[Vector, LinearRegressionModel]
-  with LinearRegressionParams with GeneralMLWritable {
+  with LinearRegressionParams with GeneralMLWritable
+  with HasTrainingSummary[LinearRegressionTrainingSummary] {
 
   private[ml] def this(uid: String, coefficients: Vector, intercept: Double) =
     this(uid, coefficients, intercept, 1.0)
-
-  private var trainingSummary: Option[LinearRegressionTrainingSummary] = None
 
   override val numFeatures: Int = coefficients.size
 
   /**
    * Gets summary (e.g. residuals, mse, r-squared ) of model on training set. An exception is
-   * thrown if `trainingSummary == None`.
+   * thrown if `hasSummary` is false.
    */
   @Since("1.5.0")
-  def summary: LinearRegressionTrainingSummary = trainingSummary.getOrElse {
-    throw new SparkException("No training summary available for this LinearRegressionModel")
-  }
-
-  private[regression]
-  def setSummary(summary: Option[LinearRegressionTrainingSummary]): this.type = {
-    this.trainingSummary = summary
-    this
-  }
-
-  /** Indicates whether a training summary exists for this model instance. */
-  @Since("1.5.0")
-  def hasSummary: Boolean = trainingSummary.isDefined
+  override def summary: LinearRegressionTrainingSummary = super.summary
 
   /**
    * Evaluates the model on a test dataset.
@@ -812,7 +791,6 @@ object LinearRegressionModel extends MLReadable[LinearRegressionModel] {
 }
 
 /**
- * :: Experimental ::
  * Linear regression training results. Currently, the training summary ignores the
  * training weights except for the objective trace.
  *
@@ -820,7 +798,6 @@ object LinearRegressionModel extends MLReadable[LinearRegressionModel] {
  * @param objectiveHistory objective function (scaled loss + regularization) at each iteration.
  */
 @Since("1.5.0")
-@Experimental
 class LinearRegressionTrainingSummary private[regression] (
     predictions: DataFrame,
     predictionCol: String,
@@ -850,7 +827,6 @@ class LinearRegressionTrainingSummary private[regression] (
 }
 
 /**
- * :: Experimental ::
  * Linear regression results evaluated on a dataset.
  *
  * @param predictions predictions output by the model's `transform` method.
@@ -860,7 +836,6 @@ class LinearRegressionTrainingSummary private[regression] (
  * @param featuresCol Field in "predictions" which gives the features of each instance as a vector.
  */
 @Since("1.5.0")
-@Experimental
 class LinearRegressionSummary private[regression] (
     @transient val predictions: DataFrame,
     val predictionCol: String,

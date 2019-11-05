@@ -63,8 +63,9 @@ import org.apache.spark.sql.types._
       > SELECT _FUNC_(10.0, array(0.5, 0.4, 0.1), 100);
        [10.0,10.0,10.0]
       > SELECT _FUNC_(10.0, 0.5, 100);
-       10.0
-  """)
+       10
+  """,
+  since = "2.1.0")
 case class ApproximatePercentile(
     child: Expression,
     percentageExpression: Expression,
@@ -132,7 +133,7 @@ case class ApproximatePercentile(
         case TimestampType => value.asInstanceOf[Long].toDouble
         case n: NumericType => n.numeric.toDouble(value.asInstanceOf[n.InternalType])
         case other: DataType =>
-          throw new UnsupportedOperationException(s"Unexpected data type ${other.simpleString}")
+          throw new UnsupportedOperationException(s"Unexpected data type ${other.catalogString}")
       }
       buffer.add(doubleValue)
     }
@@ -157,7 +158,7 @@ case class ApproximatePercentile(
       case DoubleType => doubleResult
       case _: DecimalType => doubleResult.map(Decimal(_))
       case other: DataType =>
-        throw new UnsupportedOperationException(s"Unexpected data type ${other.simpleString}")
+        throw new UnsupportedOperationException(s"Unexpected data type ${other.catalogString}")
     }
     if (result.length == 0) {
       null
